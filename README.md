@@ -1,2 +1,2 @@
 # pg-course
-Couse of Postgres
+Postgres Course
