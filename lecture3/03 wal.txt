@@ -1,0 +1,179 @@
+-- список менеджеров
+/usr/lib/postgresql/16/bin/pg_waldump -r list 
+
+sudo -u postgres psql
+-- sudo su postgres
+-- psql
+
+-------------WAL-----------------
+SELECT * FROM pg_ls_waldir() LIMIT 10;
+CREATE EXTENSION pageinspect;
+BEGIN;
+
+-- текущая позиция lsn
+SELECT pg_current_wal_insert_lsn();
+
+-- посмотрим какой у нас wal file
+SELECT pg_walfile_name('0/ECD36F88');
+
+-- после UPDATE номер lsn изменился
+DROP TABLE test;
+CREATE TABLE test(i int);
+INSERT INTO test VALUES (100),(400),(300);
+UPDATE test set i = 500 WHERE i = 400;
+SELECT lsn FROM page_header(get_raw_page('test',0));
+commit;
+
+SELECT '0/ECD53710'::pg_lsn - '0/ECD36F88'::pg_lsn;
+\! /usr/lib/postgresql/16/bin/pg_waldump -p /var/lib/postgresql/16/main/pg_wal -s 0/ECD36F88 -e 0/ECD53710 0000000100000000000000EC
+
+
+
+-- Контрольные точки 
+-- посмотрим информацию о кластере
+\! /usr/lib/postgresql/16/bin/pg_controldata /var/lib/postgresql/16/main/
+
+SELECT pg_current_wal_insert_lsn();
+CHECKPOINT;
+SELECT pg_current_wal_insert_lsn();
+
+\! /usr/lib/postgresql/16/bin/pg_waldump -p /var/lib/postgresql/16/main/pg_wal -s 0/ECD53BE8 -e 0/ECD53CD0 0000000100000000000000EC
+
+
+-- давайте проверим, попадают ли массивные данные из отмененных транзакций в WAL
+SELECT pg_current_wal_insert_lsn();
+-- 0/ECD53D30
+BEGIN;
+DROP TABLE IF EXISTS testindex;
+CREATE TABLE testindex (
+    a   int,
+    b   int
+);
+INSERT INTO testindex SELECT i, i*2
+FROM generate_series(1,100000) s(i);
+ROLLBACK;
+
+SELECT pg_current_wal_insert_lsn();
+-- 0/ED393830
+-- разница
+SELECT pg_walfile_name('0/ED393830');
+SELECT '0/ED393830'::pg_lsn - '0/ECD53D30'::pg_lsn;
+sudo /usr/lib/postgresql/16/bin/pg_waldump -p /var/lib/postgresql/16/main/pg_wal -s 0/1234F550 -e 0/12986250 000000010000000000000012
+-- как видим все попадает сначала в WAL файл, несмотря на то, что транзакция может быть отменена
+
+-- Сымитируем сбой:
+begin;
+INSERT INTO test VALUES (22222);
+
+-- sudo pg_ctlcluster 16 main stop -m immediate
+sudo pkill -9 postgres
+
+sudo /usr/lib/postgresql/16/bin/pg_controldata /var/lib/postgresql/16/main/
+
+-- кластер выключен, но статус in production
+pg_lsclusters
+
+-- запускаем кластер и убеждаемся, что данные накатились
+sudo pg_ctlcluster 16 main start
+sudo -u postgres psql
+
+SELECT * FROM test LIMIT 10;
+
+\! cat /var/log/postgresql/postgresql-16-main.log
+
+2023-01-15 13:37:14.009 UTC [12959] LOG:  database system was interrupted; last known up at 2023-01-15 11:11:11 UTC
+2023-01-15 13:37:14.056 UTC [12959] LOG:  database system was not properly shut down; automatic recovery in progress
+2023-01-15 13:37:14.061 UTC [12959] LOG:  redo starts at 0/1596AAA
+2023-01-15 13:37:14.062 UTC [12959] LOG:  invalid record length at 0/1596AAA: wanted 24, got 0
+2023-01-15 13:37:14.062 UTC [12959] LOG:  redo done at 0/1596AAA system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+
+
+-- Статистика bgwriter
+SELECT * FROM pg_stat_bgwriter \gx
+
+-- настройка 
+show fsync;
+show wal_sync_method;
+show data_checksums;
+
+
+-- Попробуем нагрузочное тестирование в синхронном и асинхронном режиме
+create database buffer_temp2;
+sudo su postgres
+pgbench -i buffer_temp2
+pgbench -P 1 -T 10 buffer_temp2
+
+
+ALTER SYSTEM SET synchronous_commit = off;
+
+pgbench -P 1 -T 20 buffer_temp
+-- почему не увидели разницы???
+
+
+-- потому что конфигурацию не перечитали
+SELECT pg_reload_conf(); 
+sudo pg_ctlcluster 16 main reload
+
+-- на простых старых hdd разница до 20 раз 
+
+
+-- VACUUM
+SELECT lp as tuple, t_xmin, t_xmax, t_field3 as t_cid, t_ctid FROM heap_page_items(get_raw_page('test',0));
+
+BEGIN;
+UPDATE test set i = 600 WHERE i = 400;
+
+
+VACUUM FULL test;
+
+-- расширение для онлайн выполнения VACUUM FULL
+-- https://github.com/reorg/pg_repack
+
+-- автовакуум
+SELECT name, setting, context, short_desc FROM pg_settings WHERE category like '%Autovacuum%';
+
+
+-- первый показатель показывает приближение проблемы
+-- второй показывает когда запустится автоматический автофриз
+-- https://www.crunchydata.com/blog/managing-transaction-id-wraparound-in-postgresql
+WITH max_age AS ( 
+    SELECT 2000000000 as max_old_xid
+        , setting AS autovacuum_freeze_max_age 
+        FROM pg_catalog.pg_settings 
+        WHERE name = 'autovacuum_freeze_max_age' )
+, per_database_stats AS ( 
+    SELECT datname
+        , m.max_old_xid::int
+        , m.autovacuum_freeze_max_age::int
+        , age(d.datfrozenxid) AS oldest_current_xid 
+    FROM pg_catalog.pg_database d 
+    JOIN max_age m ON (true) 
+    WHERE d.datallowconn ) 
+SELECT max(oldest_current_xid) AS oldest_current_xid
+    , max(ROUND(100*(oldest_current_xid/max_old_xid::float))) AS percent_towards_wraparound
+    , max(ROUND(100*(oldest_current_xid/autovacuum_freeze_max_age::float))) AS percent_towards_emergency_autovac 
+FROM per_database_stats;
+
+
+-- если пролетели с TXID
+-- Per-Table Fix
+-- If you cannot afford to do a cluster-wide vacuum and want to just get the TXID age under control 
+-- as quickly as possible, it's certainly possible, but just involves more steps than just calling a single binary command. 
+-- This is definitely the case if you've reached wraparound or are getting close.
+
+SELECT datname
+    , age(datfrozenxid)
+    , current_setting('autovacuum_freeze_max_age') 
+FROM pg_database 
+ORDER BY 2 DESC;
+
+SELECT * FROM pg_stat_activity WHERE query ~ 'autovacuum' \gx
+
+
+-- посмотрим маскимальный возраст для наших таблиц
+SELECT c.oid::regclass as table_name,
+       greatest(age(c.relfrozenxid),age(t.relfrozenxid)) as age
+FROM pg_class c
+LEFT JOIN pg_class t ON c.reltoastrelid = t.oid
+WHERE c.relkind IN ('r', 'm');
+
